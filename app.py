@@ -7,7 +7,7 @@ import streamlit as st
 st.set_page_config(page_title="BINGO CASSA", layout="wide")
 
 def _require_password():
-    password = st.secrets.get("CassaBingo2807")
+    password = st.secrets.get("APP_PASSWORD")
 
     if password is None:
         st.error("❌ APP_PASSWORD mancante. Impostalo in Settings → Secrets.")
