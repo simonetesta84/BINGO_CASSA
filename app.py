@@ -2,41 +2,42 @@
 # AUTH + CONFIG (TOP OF FILE)
 # ===========================
 
+import time
 import streamlit as st
 
 st.set_page_config(page_title="BINGO CASSA", layout="wide")
 
-def _require_password():
-    password = st.secrets.get("APP_PASSWORD")
+SESSION_TTL_SECONDS = 60 * 60 * 6  # 6 ore (cambia come vuoi)
 
-    if password is None:
+def require_password():
+    expected = st.secrets.get("APP_PASSWORD")
+    if not expected:
         st.error("❌ APP_PASSWORD mancante. Impostalo in Settings → Secrets.")
         st.stop()
 
-    # stato iniziale
-    if "authenticated" not in st.session_state:
-        st.session_state.authenticated = False
+    now = time.time()
 
-    # gate di accesso
-    if not st.session_state.authenticated:
-        st.markdown("## 🔒 Bingo Cassa – Accesso riservato")
-        st.markdown("Inserisci la password per continuare.")
+    # se già autenticato e non scaduto -> ok
+    expires_at = st.session_state.get("auth_expires_at", 0)
+    if expires_at and now < expires_at:
+        return
 
-        pwd = st.text_input("Password", type="password")
+    # se non autenticato / scaduto -> chiedi password
+    st.markdown("## 🔒 Bingo Cassa – Accesso riservato")
+    pwd = st.text_input("Password", type="password")
 
-        if pwd == "":
-            st.stop()
+    if not pwd:
+        st.stop()
 
-        if pwd != password:
-            st.error("Password errata")
-            st.stop()
+    if pwd != expected:
+        st.error("Password errata")
+        st.stop()
 
-        # OK
-        st.session_state.authenticated = True
-        st.rerun()
+    # autentica per TTL
+    st.session_state["auth_expires_at"] = now + SESSION_TTL_SECONDS
+    st.rerun()
 
-_require_password()
-
+require_password()
 # ===========================
 # IMPORT RESTO APP (DOPO AUTH)
 # ===========================
