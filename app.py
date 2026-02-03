@@ -46,17 +46,17 @@ import sqlite3
 from datetime import date, datetime, time, timedelta
 from typing import Dict, List, Tuple, Optional
 from zoneinfo import ZoneInfo
-from pathlib import Path
 
 import pandas as pd
+import streamlit as st
 
-# ===========================
-# CONFIG
-# ===========================
+# ---------------------------
+# Config
+# ---------------------------
+st.set_page_config(page_title="BINGO CASSA", layout="wide")
+DB_PATH = "incassi_app.sqlite3"
 
-BASE_DIR = Path(__file__).parent
-DB_PATH = str(BASE_DIR / "incassi_app.sqlite3")
-
+# Business day: 12:00 -> 12:00 (Europe/Zurich)
 TZ = ZoneInfo("Europe/Zurich")
 CUTOFF_HOUR = 12
 
@@ -589,6 +589,7 @@ if "seed_done" not in st.session_state:
 # usa query param ?page=...
 # ---------------------------
 
+
 # query param corrente
 qp = st.query_params
 current = qp.get("page", "incassi")
@@ -600,10 +601,6 @@ KEY_TO_PAGE = {
     "storico": "Storico Incassi",
 }
 
-# Icona Incassi (CTA)
-ICON_INCASSI = '<svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="6" width="18" height="12" rx="2"></rect><path d="M7 12h2"></path><path d="M15 12h2"></path></svg>'
-
-# MENU (senza Incassi)
 NAV_MENU = [
     ("dashboard", "Dashboard",
      '<svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 13h8V3H3v10z"></path><path d="M13 21h8V11h-8v10z"></path><path d="M13 3h8v6h-8V3z"></path><path d="M3 17h8v4H3v-4z"></path></svg>'),
@@ -613,26 +610,25 @@ NAV_MENU = [
      '<svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"></path><path d="M7 14l4-4 3 3 6-6"></path></svg>'),
 ]
 
+def _goto(page_key: str):
+    st.query_params["page"] = page_key
+    st.rerun()
+
 # Variabile page per il resto del codice
 page = KEY_TO_PAGE.get(current, "Registra Incassi")
 
-# ---------------------------
-# Sidebar: CTA + (CALENDARIO SOTTO CTA) + Titolo + Menu
-# ---------------------------
 with st.sidebar:
-    # CTA Incassi sopra al titolo
+    # CTA "Incassi" (usa button, non <a>)
     cta_active = "active" if current == "incassi" else ""
-    st.markdown(
-        "<div class='sb-cta-wrap'>"
-        f"<a class='sb-cta {cta_active}' href='?page=incassi'>"
-        f"{ICON_INCASSI}"
-        "<span>Incassi</span>"
-        "</a>"
-        "</div>",
-        unsafe_allow_html=True
-    )
+    st.markdown(f"<div class='sb-cta-wrap'>", unsafe_allow_html=True)
 
-    # ✅ Calendario sotto il bottone Incassi (solo Dashboard e Incassi)
+    # Usiamo un bottone Streamlit e lo “vestiamo” con CSS già esistente
+    if st.button("Incassi", key="nav_incassi", width="stretch"):
+        _goto("incassi")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # Calendario sotto CTA (come avevi)
     if page in ["Dashboard", "Registra Incassi"]:
         default_bd = business_day_for(datetime.now(TZ), cutoff_hour=CUTOFF_HOUR)
         day = st.date_input(
@@ -649,21 +645,18 @@ with st.sidebar:
     else:
         day_str = date.today().isoformat()
 
-    # Titolo come prima (sotto calendario)
     st.markdown("<div class='sb-title'>BINGO CASSA</div>", unsafe_allow_html=True)
 
-    # Menu identico ma senza Incassi
-    html = ["<div class='sb-nav'>"]
+    # Menu: usa bottoni (stesso tab)
+    st.markdown("<div class='sb-nav'>", unsafe_allow_html=True)
     for key, label, icon_svg in NAV_MENU:
         is_active = "active" if key == current else ""
-        html.append(
-            f"<a class='sb-item {is_active}' href='?page={key}'>"
-            f"{icon_svg}"
-            f"<span>{label}</span>"
-            f"</a>"
-        )
-    html.append("</div>")
-    st.markdown("".join(html), unsafe_allow_html=True)
+
+        # Riga “finta” con icona+testo, click = button invisibile sopra
+        # (semplice: facciamo bottone normale)
+        if st.button(label, key=f"nav_{key}", width="stretch"):
+            _goto(key)
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 # ---------------------------
