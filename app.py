@@ -2,17 +2,37 @@ import sqlite3
 from datetime import date, datetime, time, timedelta
 from typing import Dict, List, Tuple, Optional
 from zoneinfo import ZoneInfo
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
-# ---------------------------
-# Config
-# ---------------------------
 st.set_page_config(page_title="BINGO CASSA", layout="wide")
-DB_PATH = "incassi_app.sqlite3"
 
-# Business day: 12:00 -> 12:00 (Europe/Zurich)
+def check_password():
+    expected = st.secrets.get("APP_PASSWORD", None)
+    if expected is None:
+        st.error("Secret APP_PASSWORD mancante. Vai in Settings → Secrets.")
+        st.stop()
+
+    if "auth" not in st.session_state:
+        st.session_state.auth = False
+
+    if not st.session_state.auth:
+        st.title("🔒 Bingo Cassa – Accesso riservato")
+        pwd = st.text_input("Password", type="password")
+        if pwd == expected:
+            st.session_state.auth = True
+            st.rerun()
+        else:
+            st.stop()
+
+check_password()
+
+# Config (solo dopo login)
+BASE_DIR = Path(__file__).parent
+DB_PATH = str(BASE_DIR / "incassi_app.sqlite3")
+
 TZ = ZoneInfo("Europe/Zurich")
 CUTOFF_HOUR = 12
 
