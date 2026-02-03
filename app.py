@@ -1,3 +1,46 @@
+# ===========================
+# AUTH + CONFIG (TOP OF FILE)
+# ===========================
+
+import streamlit as st
+
+st.set_page_config(page_title="BINGO CASSA", layout="wide")
+
+def _require_password():
+    password = st.secrets.get("APP_PASSWORD")
+
+    if password is None:
+        st.error("❌ APP_PASSWORD mancante. Impostalo in Settings → Secrets.")
+        st.stop()
+
+    # stato iniziale
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+
+    # gate di accesso
+    if not st.session_state.authenticated:
+        st.markdown("## 🔒 Bingo Cassa – Accesso riservato")
+        st.markdown("Inserisci la password per continuare.")
+
+        pwd = st.text_input("Password", type="password")
+
+        if pwd == "":
+            st.stop()
+
+        if pwd != password:
+            st.error("Password errata")
+            st.stop()
+
+        # OK
+        st.session_state.authenticated = True
+        st.rerun()
+
+_require_password()
+
+# ===========================
+# IMPORT RESTO APP (DOPO AUTH)
+# ===========================
+
 import sqlite3
 from datetime import date, datetime, time, timedelta
 from typing import Dict, List, Tuple, Optional
@@ -5,31 +48,11 @@ from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import pandas as pd
-import streamlit as st
 
-st.set_page_config(page_title="BINGO CASSA", layout="wide")
+# ===========================
+# CONFIG
+# ===========================
 
-def check_password():
-    expected = st.secrets.get("APP_PASSWORD", None)
-    if expected is None:
-        st.error("Secret APP_PASSWORD mancante. Vai in Settings → Secrets.")
-        st.stop()
-
-    if "auth" not in st.session_state:
-        st.session_state.auth = False
-
-    if not st.session_state.auth:
-        st.title("🔒 Bingo Cassa – Accesso riservato")
-        pwd = st.text_input("Password", type="password")
-        if pwd == expected:
-            st.session_state.auth = True
-            st.rerun()
-        else:
-            st.stop()
-
-check_password()
-
-# Config (solo dopo login)
 BASE_DIR = Path(__file__).parent
 DB_PATH = str(BASE_DIR / "incassi_app.sqlite3")
 
