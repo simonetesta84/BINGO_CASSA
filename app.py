@@ -1,7 +1,3 @@
-import streamlit as st
-st.error("TEST: STO ESEGUENDO app.py")
-st.stop()
-
 # ===========================
 # AUTH + CONFIG (TOP OF FILE)
 # ===========================
@@ -11,7 +7,7 @@ import streamlit as st
 st.set_page_config(page_title="BINGO CASSA", layout="wide")
 
 def _require_password():
-    password = st.secrets.get("APP_PASSWORD")
+    password = st.secrets.get("CassaBingo2807")
 
     if password is None:
         st.error("❌ APP_PASSWORD mancante. Impostalo in Settings → Secrets.")
