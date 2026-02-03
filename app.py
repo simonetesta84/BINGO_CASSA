@@ -1,3 +1,7 @@
+import streamlit as st
+st.error("TEST: STO ESEGUENDO app.py")
+st.stop()
+
 # ===========================
 # AUTH + CONFIG (TOP OF FILE)
 # ===========================
