@@ -79,13 +79,17 @@ def now_ms() -> int:
 # ===========================
 @st.cache_resource
 def turso_engine():
-    # sqlalchemy-libsql
-    return create_engine(
-        "sqlite+libsql://",
-        connect_args={"url": TURSO_URL, "auth_token": TURSO_TOKEN},
-        future=True,
+    TURSO_DATABASE_URL = st.secrets["TURSO_DATABASE_URL"]   # es: libsql://xxxx.turso.io
+    TURSO_AUTH_TOKEN   = st.secrets["TURSO_AUTH_TOKEN"]
+
+    # Remote only (no embedded replica)
+    # Costruisce: sqlite+libsql://xxxx.turso.io?secure=true
+    engine = create_engine(
+        f"sqlite+{TURSO_DATABASE_URL}?secure=true",
+        connect_args={"auth_token": TURSO_AUTH_TOKEN},
         pool_pre_ping=True,
     )
+    return engine
 
 # ===========================
 # LOCAL SQLITE CONN
