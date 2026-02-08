@@ -1,6 +1,13 @@
 # ===========================
 # AUTH + CONFIG (TOP OF FILE)
 # ===========================
+import time
+import streamlit as st
+
+st.set_page_config(page_title="BINGO CASSA", layout="wide")
+
+SESSION_TTL_SECONDS = 60 * 60 * 6  # 6 ore (cambia come vuoi)
+
 def require_password():
     """
     CONSIGLIO: metti APP_PASSWORD in st.secrets (Settings → Secrets).
@@ -33,13 +40,6 @@ def require_password():
 
 
 require_password()
-
-import time
-import streamlit as st
-
-st.set_page_config(page_title="BINGO CASSA", layout="wide")
-
-SESSION_TTL_SECONDS = 60 * 60 * 6  # 6 ore (cambia come vuoi)
 
 # ===========================
 # IMPORT RESTO APP (DOPO AUTH)
