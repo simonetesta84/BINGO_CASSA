@@ -3,6 +3,18 @@
 # - Ogni bottone che scrive -> write_and_sync(...)
 # - ID UUID (TEXT) + updated_at (epoch ms) + deleted (soft delete)
 # - Migrazione automatica da vecchio schema con INTEGER AUTOINCREMENT
+# - DDL Turso robusto: exec_driver_sql + no-index-on-turso (evita errori)
+#
+# Secrets (Streamlit):
+# APP_PASSWORD="..."
+# TURSO_DATABASE_URL="libsql://xxxx.turso.io"
+# TURSO_AUTH_TOKEN="xxxxx"
+#
+# requirements.txt:
+# streamlit
+# pandas
+# sqlalchemy>=2.0
+# sqlalchemy-libsql
 # ============================================================
 
 from __future__ import annotations
@@ -10,14 +22,14 @@ from __future__ import annotations
 import time
 import uuid
 import sqlite3
-from dataclasses import dataclass
 from datetime import date, datetime, time as dtime, timedelta
 from typing import Dict, List, Tuple, Optional, Callable
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine
+from sqlalchemy.exc import DBAPIError
 
 # ===========================
 # PAGE CONFIG (SOLO UNA VOLTA)
@@ -57,7 +69,7 @@ require_password()
 # ===========================
 # CONFIG
 # ===========================
-DB_PATH = "incassi_app.sqlite3"  # locale (cache) — su Community Cloud può essere effimero
+DB_PATH = "incassi_app.sqlite3"  # locale (cache) — su Community Cloud è effimero
 TZ = ZoneInfo("Europe/Zurich")
 CUTOFF_HOUR = 12
 
@@ -79,17 +91,26 @@ def now_ms() -> int:
 # ===========================
 @st.cache_resource
 def turso_engine():
-    TURSO_DATABASE_URL = st.secrets["TURSO_DATABASE_URL"]   # es: libsql://xxxx.turso.io
-    TURSO_AUTH_TOKEN   = st.secrets["TURSO_AUTH_TOKEN"]
-
-    # Remote only (no embedded replica)
+    # Remote only
     # Costruisce: sqlite+libsql://xxxx.turso.io?secure=true
     engine = create_engine(
-        f"sqlite+{TURSO_DATABASE_URL}?secure=true",
-        connect_args={"auth_token": TURSO_AUTH_TOKEN},
+        f"sqlite+{TURSO_URL}?secure=true",
+        connect_args={"auth_token": TURSO_TOKEN},
         pool_pre_ping=True,
     )
     return engine
+
+def turso_smoke_test() -> bool:
+    try:
+        with turso_engine().connect() as con:
+            con.exec_driver_sql("SELECT 1;")
+        return True
+    except Exception as e:
+        st.error(f"❌ Turso non raggiungibile / credenziali errate: {e}")
+        return False
+
+if not turso_smoke_test():
+    st.stop()
 
 # ===========================
 # LOCAL SQLITE CONN
@@ -122,8 +143,9 @@ def fmt_time_from_iso(iso_str: str) -> str:
 
 # ===========================
 # SCHEMA (NUOVO)
+#   - Su Turso creiamo SOLO tabelle (niente indici) per stabilità
 # ===========================
-LOCAL_SCHEMA = """
+LOCAL_TABLES = """
 CREATE TABLE IF NOT EXISTS waiters (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL UNIQUE,
@@ -146,9 +168,6 @@ CREATE TABLE IF NOT EXISTS transactions (
   FOREIGN KEY (waiter_id) REFERENCES waiters(id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_transactions_day_waiter ON transactions(day, waiter_id);
-CREATE INDEX IF NOT EXISTS idx_transactions_updated_at ON transactions(updated_at);
-
 CREATE TABLE IF NOT EXISTS shift_waiters (
   day TEXT NOT NULL,
   waiter_id TEXT NOT NULL,
@@ -159,7 +178,12 @@ CREATE TABLE IF NOT EXISTS shift_waiters (
 );
 """
 
-TURSO_SCHEMA = LOCAL_SCHEMA + """
+LOCAL_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_transactions_day_waiter ON transactions(day, waiter_id);
+CREATE INDEX IF NOT EXISTS idx_transactions_updated_at ON transactions(updated_at);
+"""
+
+TURSO_TABLES = LOCAL_TABLES + """
 CREATE TABLE IF NOT EXISTS sync_state (
   k TEXT PRIMARY KEY,
   v INTEGER NOT NULL
@@ -168,78 +192,86 @@ CREATE TABLE IF NOT EXISTS sync_state (
 
 def exec_many_sqlite(c: sqlite3.Connection, sql: str):
     cur = c.cursor()
-    for stmt in sql.strip().split(";"):
-        s = stmt.strip()
-        if s:
-            cur.execute(s)
+    for stmt in [s.strip() for s in sql.split(";") if s.strip()]:
+        cur.execute(stmt)
     c.commit()
 
 def exec_many_turso(engine, sql: str):
+    """
+    DDL robusto per Turso/libSQL:
+    - usa exec_driver_sql (più compatibile)
+    - stampa statement incriminato (senza secrets) se fallisce
+    """
+    stmts = [s.strip() for s in sql.split(";") if s.strip()]
     with engine.begin() as con:
-        for stmt in sql.strip().split(";"):
-            s = stmt.strip()
-            if s:
-                con.execute(text(s))
+        for s in stmts:
+            try:
+                con.exec_driver_sql(s)
+            except DBAPIError as e:
+                preview = (s[:200] + "…") if len(s) > 200 else s
+                raise RuntimeError(f"Errore DDL Turso sullo statement:\n{preview}\n\nDettaglio: {e}") from e
 
 # ===========================
 # MIGRAZIONE (vecchio schema INTEGER -> nuovo UUID)
 # ===========================
-def table_has_column_sqlite(c: sqlite3.Connection, table: str, col: str) -> bool:
-    cur = c.cursor()
-    cur.execute(f"PRAGMA table_info({table});")
-    return any(r[1] == col for r in cur.fetchall())
-
 def table_exists_sqlite(c: sqlite3.Connection, table: str) -> bool:
     cur = c.cursor()
     cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?;", (table,))
     return cur.fetchone() is not None
 
+def table_has_column_sqlite(c: sqlite3.Connection, table: str, col: str) -> bool:
+    cur = c.cursor()
+    cur.execute(f"PRAGMA table_info({table});")
+    return any(r[1] == col for r in cur.fetchall())
+
 def migrate_if_needed(c: sqlite3.Connection):
-    # Se esistono tabelle ma NON hanno id TEXT (nuovo schema), migro.
-    if not table_exists_sqlite(c, "waiters"):
+    """
+    Migrazione solo su SQLite locale (cache).
+    Se trova vecchio schema (INTEGER id, senza updated_at/deleted),
+    crea nuovo schema UUID e porta i dati.
+    """
+    if not table_exists_sqlite(c, "waiters") or not table_exists_sqlite(c, "transactions"):
         return
 
-    # vecchio schema: waiters.id INTEGER e NON esiste updated_at
-    is_old = not table_has_column_sqlite(c, "waiters", "updated_at") or table_has_column_sqlite(c, "waiters", "active") and not table_has_column_sqlite(c, "waiters", "deleted")
+    # Heuristica "vecchio schema"
+    is_old = (not table_has_column_sqlite(c, "waiters", "updated_at")) or (not table_has_column_sqlite(c, "waiters", "deleted"))
     if not is_old:
         return
 
     cur = c.cursor()
 
-    # Backup tables
+    # Rinominare vecchie
     cur.execute("ALTER TABLE waiters RENAME TO waiters_old;")
     cur.execute("ALTER TABLE transactions RENAME TO transactions_old;")
     if table_exists_sqlite(c, "shift_waiters"):
         cur.execute("ALTER TABLE shift_waiters RENAME TO shift_waiters_old;")
-
     c.commit()
 
-    # Create new schema
-    exec_many_sqlite(c, LOCAL_SCHEMA)
+    # Nuovo schema
+    exec_many_sqlite(c, LOCAL_TABLES)
+    exec_many_sqlite(c, LOCAL_INDEXES)
 
-    # Map old waiter int -> new uuid
+    # Map waiters
     cur.execute("SELECT id, name, active, created_at FROM waiters_old;")
     rows = cur.fetchall()
     waiter_map: Dict[int, str] = {}
+
     for wid_int, name, active, created_at in rows:
         new_id = str(uuid.uuid4())
         waiter_map[int(wid_int)] = new_id
         cur.execute(
             "INSERT INTO waiters(id,name,active,created_at,updated_at,deleted) VALUES (?,?,?,?,?,0);",
-            (new_id, name, int(active), created_at or now_iso(), now_ms())
+            (new_id, str(name), int(active), created_at or now_iso(), now_ms())
         )
 
-    # Transactions migrate
-    # vecchio schema potrebbe avere settled/voided già aggiunti
+    # Transactions
     cols = [r[1] for r in cur.execute("PRAGMA table_info(transactions_old);").fetchall()]
     has_settled = "settled" in cols
     has_voided = "voided" in cols
 
     q = "SELECT id, day, waiter_id, amount, created_at"
-    if has_settled: q += ", settled"
-    else: q += ", 0 as settled"
-    if has_voided: q += ", voided"
-    else: q += ", 0 as voided"
+    q += ", settled" if has_settled else ", 0 as settled"
+    q += ", voided" if has_voided else ", 0 as voided"
     q += " FROM transactions_old;"
     cur.execute(q)
     tx_rows = cur.fetchall()
@@ -253,10 +285,10 @@ def migrate_if_needed(c: sqlite3.Connection):
             """INSERT INTO transactions
                (id, day, waiter_id, amount, created_at, updated_at, settled, voided, deleted)
                VALUES (?,?,?,?,?,?,?,?,0);""",
-            (new_tx_id, day, new_waiter_id, float(amount), created_at or now_iso(), now_ms(), int(settled), int(voided))
+            (new_tx_id, str(day), new_waiter_id, float(amount), created_at or now_iso(), now_ms(), int(settled), int(voided))
         )
 
-    # shift_waiters migrate (se esisteva)
+    # shift_waiters (se c'era)
     if table_exists_sqlite(c, "shift_waiters_old"):
         cur.execute("SELECT day, waiter_id FROM shift_waiters_old;")
         for day, wid_int in cur.fetchall():
@@ -264,19 +296,26 @@ def migrate_if_needed(c: sqlite3.Connection):
             if new_waiter_id:
                 cur.execute(
                     "INSERT OR REPLACE INTO shift_waiters(day,waiter_id,updated_at,deleted) VALUES (?,?,?,0);",
-                    (day, new_waiter_id, now_ms())
+                    (str(day), new_waiter_id, now_ms())
                 )
 
     c.commit()
 
 # ===========================
-# INIT DB
+# INIT DBs
 # ===========================
 def init_dbs():
     lc = local_conn()
+
+    # 1) migrazione locale
     migrate_if_needed(lc)
-    exec_many_sqlite(lc, LOCAL_SCHEMA)
-    exec_many_turso(turso_engine(), TURSO_SCHEMA)
+
+    # 2) schema locale (tables + indexes)
+    exec_many_sqlite(lc, LOCAL_TABLES)
+    exec_many_sqlite(lc, LOCAL_INDEXES)
+
+    # 3) schema Turso (solo tables, niente indexes)
+    exec_many_turso(turso_engine(), TURSO_TABLES)
 
 init_dbs()
 
@@ -286,26 +325,29 @@ init_dbs()
 def get_sync_ts(key: str) -> int:
     eng = turso_engine()
     with eng.begin() as con:
-        row = con.execute(text("SELECT v FROM sync_state WHERE k=:k;"), {"k": key}).fetchone()
+        row = con.exec_driver_sql("SELECT v FROM sync_state WHERE k=?;", (key,)).fetchone()
         if row:
             return int(row[0])
-        con.execute(text("INSERT INTO sync_state(k,v) VALUES(:k,0);"), {"k": key})
+        con.exec_driver_sql("INSERT INTO sync_state(k,v) VALUES(?,0);", (key,))
         return 0
 
 def set_sync_ts(key: str, v: int):
     eng = turso_engine()
     with eng.begin() as con:
-        con.execute(text("""
-            INSERT INTO sync_state(k,v) VALUES(:k,:v)
+        con.exec_driver_sql(
+            """
+            INSERT INTO sync_state(k,v) VALUES(?,?)
             ON CONFLICT(k) DO UPDATE SET v=excluded.v;
-        """), {"k": key, "v": int(v)})
+            """,
+            (key, int(v)),
+        )
 
 # ===========================
-# SYNC (PUSH/PULL)
+# UPSERT STATEMENTS (TURSO)
 # ===========================
 UPSERT_WAITER = """
 INSERT INTO waiters (id,name,active,created_at,updated_at,deleted)
-VALUES (:id,:name,:active,:created_at,:updated_at,:deleted)
+VALUES (?,?,?,?,?,?)
 ON CONFLICT(id) DO UPDATE SET
   name=excluded.name,
   active=excluded.active,
@@ -317,7 +359,7 @@ WHERE excluded.updated_at >= waiters.updated_at;
 
 UPSERT_TX = """
 INSERT INTO transactions (id,day,waiter_id,amount,created_at,updated_at,settled,voided,deleted)
-VALUES (:id,:day,:waiter_id,:amount,:created_at,:updated_at,:settled,:voided,:deleted)
+VALUES (?,?,?,?,?,?,?,?,?)
 ON CONFLICT(id) DO UPDATE SET
   day=excluded.day,
   waiter_id=excluded.waiter_id,
@@ -332,13 +374,16 @@ WHERE excluded.updated_at >= transactions.updated_at;
 
 UPSERT_SHIFT = """
 INSERT INTO shift_waiters (day,waiter_id,updated_at,deleted)
-VALUES (:day,:waiter_id,:updated_at,:deleted)
+VALUES (?,?,?,?)
 ON CONFLICT(day,waiter_id) DO UPDATE SET
   updated_at=excluded.updated_at,
   deleted=excluded.deleted
 WHERE excluded.updated_at >= shift_waiters.updated_at;
 """
 
+# ===========================
+# SYNC (PUSH / PULL)
+# ===========================
 def push_local_to_turso() -> int:
     lc = local_conn()
     eng = turso_engine()
@@ -347,19 +392,16 @@ def push_local_to_turso() -> int:
     max_ts = last
     pushed = 0
 
-    # WAITERS
     w_df = pd.read_sql_query(
         "SELECT id,name,active,created_at,updated_at,deleted FROM waiters WHERE updated_at > ?;",
         lc,
         params=(last,),
     )
-    # TRANSACTIONS
     t_df = pd.read_sql_query(
         "SELECT id,day,waiter_id,amount,created_at,updated_at,settled,voided,deleted FROM transactions WHERE updated_at > ?;",
         lc,
         params=(last,),
     )
-    # SHIFT
     s_df = pd.read_sql_query(
         "SELECT day,waiter_id,updated_at,deleted FROM shift_waiters WHERE updated_at > ?;",
         lc,
@@ -368,15 +410,27 @@ def push_local_to_turso() -> int:
 
     with eng.begin() as con:
         for _, r in w_df.iterrows():
-            con.execute(text(UPSERT_WAITER), r.to_dict())
+            con.exec_driver_sql(
+                UPSERT_WAITER,
+                (r["id"], r["name"], int(r["active"]), r["created_at"], int(r["updated_at"]), int(r["deleted"])),
+            )
             max_ts = max(max_ts, int(r["updated_at"]))
             pushed += 1
+
         for _, r in t_df.iterrows():
-            con.execute(text(UPSERT_TX), r.to_dict())
+            con.exec_driver_sql(
+                UPSERT_TX,
+                (r["id"], r["day"], r["waiter_id"], float(r["amount"]), r["created_at"], int(r["updated_at"]),
+                 int(r["settled"]), int(r["voided"]), int(r["deleted"])),
+            )
             max_ts = max(max_ts, int(r["updated_at"]))
             pushed += 1
+
         for _, r in s_df.iterrows():
-            con.execute(text(UPSERT_SHIFT), r.to_dict())
+            con.exec_driver_sql(
+                UPSERT_SHIFT,
+                (r["day"], r["waiter_id"], int(r["updated_at"]), int(r["deleted"])),
+            )
             max_ts = max(max_ts, int(r["updated_at"]))
             pushed += 1
 
@@ -393,14 +447,26 @@ def pull_turso_to_local() -> int:
     pulled = 0
 
     with eng.begin() as con:
-        w_rows = con.execute(text("SELECT id,name,active,created_at,updated_at,deleted FROM waiters WHERE updated_at > :ts;"), {"ts": last}).mappings().all()
-        t_rows = con.execute(text("SELECT id,day,waiter_id,amount,created_at,updated_at,settled,voided,deleted FROM transactions WHERE updated_at > :ts;"), {"ts": last}).mappings().all()
-        s_rows = con.execute(text("SELECT day,waiter_id,updated_at,deleted FROM shift_waiters WHERE updated_at > :ts;"), {"ts": last}).mappings().all()
+        w_rows = con.exec_driver_sql(
+            "SELECT id,name,active,created_at,updated_at,deleted FROM waiters WHERE updated_at > ?;",
+            (last,),
+        ).fetchall()
+
+        t_rows = con.exec_driver_sql(
+            "SELECT id,day,waiter_id,amount,created_at,updated_at,settled,voided,deleted FROM transactions WHERE updated_at > ?;",
+            (last,),
+        ).fetchall()
+
+        s_rows = con.exec_driver_sql(
+            "SELECT day,waiter_id,updated_at,deleted FROM shift_waiters WHERE updated_at > ?;",
+            (last,),
+        ).fetchall()
 
     cur = lc.cursor()
 
-    for r in w_rows:
-        cur.execute("""
+    for (id_, name, active, created_at, updated_at, deleted) in w_rows:
+        cur.execute(
+            """
             INSERT INTO waiters(id,name,active,created_at,updated_at,deleted)
             VALUES (?,?,?,?,?,?)
             ON CONFLICT(id) DO UPDATE SET
@@ -410,12 +476,15 @@ def pull_turso_to_local() -> int:
               updated_at=excluded.updated_at,
               deleted=excluded.deleted
             WHERE excluded.updated_at >= waiters.updated_at;
-        """, (r["id"], r["name"], int(r["active"]), r["created_at"], int(r["updated_at"]), int(r["deleted"])))
-        max_ts = max(max_ts, int(r["updated_at"]))
+            """,
+            (str(id_), str(name), int(active), str(created_at), int(updated_at), int(deleted)),
+        )
+        max_ts = max(max_ts, int(updated_at))
         pulled += 1
 
-    for r in t_rows:
-        cur.execute("""
+    for (id_, day, waiter_id, amount, created_at, updated_at, settled, voided, deleted) in t_rows:
+        cur.execute(
+            """
             INSERT INTO transactions(id,day,waiter_id,amount,created_at,updated_at,settled,voided,deleted)
             VALUES (?,?,?,?,?,?,?,?,?)
             ON CONFLICT(id) DO UPDATE SET
@@ -428,20 +497,25 @@ def pull_turso_to_local() -> int:
               voided=excluded.voided,
               deleted=excluded.deleted
             WHERE excluded.updated_at >= transactions.updated_at;
-        """, (r["id"], r["day"], r["waiter_id"], float(r["amount"]), r["created_at"], int(r["updated_at"]), int(r["settled"]), int(r["voided"]), int(r["deleted"])))
-        max_ts = max(max_ts, int(r["updated_at"]))
+            """,
+            (str(id_), str(day), str(waiter_id), float(amount), str(created_at), int(updated_at), int(settled), int(voided), int(deleted)),
+        )
+        max_ts = max(max_ts, int(updated_at))
         pulled += 1
 
-    for r in s_rows:
-        cur.execute("""
+    for (day, waiter_id, updated_at, deleted) in s_rows:
+        cur.execute(
+            """
             INSERT INTO shift_waiters(day,waiter_id,updated_at,deleted)
             VALUES (?,?,?,?)
             ON CONFLICT(day,waiter_id) DO UPDATE SET
               updated_at=excluded.updated_at,
               deleted=excluded.deleted
             WHERE excluded.updated_at >= shift_waiters.updated_at;
-        """, (r["day"], r["waiter_id"], int(r["updated_at"]), int(r["deleted"])))
-        max_ts = max(max_ts, int(r["updated_at"]))
+            """,
+            (str(day), str(waiter_id), int(updated_at), int(deleted)),
+        )
+        max_ts = max(max_ts, int(updated_at))
         pulled += 1
 
     lc.commit()
@@ -592,7 +666,7 @@ def history_df(date_from: str, date_to: str, waiter_id: Optional[str]) -> pd.Dat
     JOIN waiters w ON w.id=t.waiter_id
     WHERE t.day BETWEEN ? AND ? AND t.deleted=0 AND w.deleted=0
     """
-    params = [date_from, date_to]
+    params: List[str] = [date_from, date_to]
     if waiter_id:
         q += " AND t.waiter_id=?"
         params.append(waiter_id)
@@ -615,7 +689,6 @@ def set_shift_waiters(day_str: str, waiter_ids: List[str]):
     cur = c.cursor()
     ts = now_ms()
 
-    # soft-delete tutti quelli del giorno, poi riattivo quelli selezionati
     cur.execute("UPDATE shift_waiters SET deleted=1, updated_at=? WHERE day=?;", (ts, day_str))
     for wid in waiter_ids:
         cur.execute("""
@@ -623,7 +696,8 @@ def set_shift_waiters(day_str: str, waiter_ids: List[str]):
             VALUES (?,?,?,0)
             ON CONFLICT(day,waiter_id) DO UPDATE SET
               updated_at=excluded.updated_at,
-              deleted=0;
+              deleted=0
+            WHERE excluded.updated_at >= shift_waiters.updated_at;
         """, (day_str, wid, ts))
     c.commit()
 
@@ -641,27 +715,15 @@ if "seed_done" not in st.session_state:
     if len(get_waiters(active_only=False)) == 0:
         for n in ["Anna Bianchi", "Luigi Verdi", "Mario Rossi"]:
             try:
-                # seed locale + sync
                 write_and_sync(lambda nn=n: add_waiter(nn))
             except Exception:
                 pass
     st.session_state["seed_done"] = True
 
 # ============================================================
-# QUI SOTTO: la tua UI (CSS, sidebar, keypad, pagine)
-# Ti mostro solo come cambiano i PUNTI DI SCRITTURA:
-# - add_tx, void_tx, settle..., add_waiter, set_waiter_active, set_shift_waiters
-# devono passare da write_and_sync(...)
+# UI — versione "base" (puoi reinserire il tuo CSS e layout)
 # ============================================================
 
-# ---------------------------
-# (OPZIONALE) il tuo CSS qui
-# ---------------------------
-# st.markdown("...tuo css...", unsafe_allow_html=True)
-
-# ---------------------------
-# Tastierino (puoi riusare il tuo)
-# ---------------------------
 def keypad_widget(prefix: str, currency: str = "€") -> float:
     buf_key = f"{prefix}_buf"
     if buf_key not in st.session_state:
@@ -692,24 +754,17 @@ def keypad_widget(prefix: str, currency: str = "€") -> float:
     val = _get_value()
     st.write(f"{currency} {val:,.2f}".replace(",", " "))
 
-    grid = [
-        ["1", "2", "3"],
-        ["4", "5", "6"],
-        ["7", "8", "9"],
-        [".", "0", "Reset"],
-    ]
+    grid = [["1", "2", "3"], ["4", "5", "6"], ["7", "8", "9"], [".", "0", "Reset"]]
     for row in grid:
         cols = st.columns(3)
         for i, ch in enumerate(row):
-            if cols[i].button(ch, key=f"{prefix}_k_{ch}"):
+            if cols[i].button(ch, key=f"{prefix}_k_{ch}", use_container_width=True):
                 press(ch)
                 st.rerun()
-
     return _get_value()
 
 # ---------------------------
-# Sidebar nav (versione base)
-# (se vuoi, rimetti la tua identica)
+# Sidebar nav
 # ---------------------------
 qp = st.query_params
 current = qp.get("page", "incassi")
@@ -728,20 +783,22 @@ def _goto(page_key: str):
 page = KEY_TO_PAGE.get(current, "Registra Incassi")
 
 with st.sidebar:
-    if st.button("Dashboard"): _goto("dashboard")
-    if st.button("Incassi"): _goto("incassi")
-    if st.button("Camerieri"): _goto("camerieri")
-    if st.button("Storico"): _goto("storico")
+    st.markdown("### BINGO CASSA")
+    if st.button("Dashboard", use_container_width=True): _goto("dashboard")
+    if st.button("Incassi", use_container_width=True): _goto("incassi")
+    if st.button("Camerieri", use_container_width=True): _goto("camerieri")
+    if st.button("Storico", use_container_width=True): _goto("storico")
 
     if page in ["Dashboard", "Registra Incassi"]:
         default_bd = business_day_for(datetime.now(TZ), cutoff_hour=CUTOFF_HOUR)
         day = st.date_input("Giornata (12:00 → 12:00)", value=default_bd, key="sidebar_day")
         day_str = day.isoformat()
+        start_dt, end_dt = business_day_range(day, cutoff_hour=CUTOFF_HOUR)
+        st.caption(f"Intervallo: {start_dt.strftime('%d.%m.%Y %H:%M')} → {end_dt.strftime('%d.%m.%Y %H:%M')}")
     else:
         day_str = date.today().isoformat()
 
-    # Sync manuale (utile per debug)
-    if st.button("🔁 Sync ora (push+pull)"):
+    if st.button("🔁 Sync ora (push+pull)", use_container_width=True):
         try:
             pushed = push_local_to_turso()
             pulled = pull_turso_to_local()
@@ -791,15 +848,14 @@ elif page == "Registra Incassi":
     selected_ids = [name_to_id[n] for n in selected_names if n in name_to_id]
 
     tot_open_map = totals_unsettled_by_waiter_for_day(day_str)
-    tot_paid_map = totals_settled_by_waiter_for_day(day_str)
 
     if not selected_ids:
         st.info("Seleziona i camerieri in servizio in fondo alla pagina per iniziare.")
     else:
         cols = st.columns(len(selected_ids), gap="large")
         for i, wid in enumerate(selected_ids):
-            name = id_to_name[wid]
             with cols[i]:
+                name = id_to_name[wid]
                 txs = tx_by_waiter_for_day(day_str, wid)
                 tot_open = tot_open_map.get(wid, 0.0)
 
@@ -808,28 +864,24 @@ elif page == "Registra Incassi":
 
                 amount = keypad_widget(prefix=f"kp_{day_str}_{wid}")
 
-                # ✅ WRITE: Aggiungi -> write_and_sync
                 if st.button("Aggiungi", key=f"add_{day_str}_{wid}", type="primary", use_container_width=True):
                     write_and_sync(lambda: add_tx(day_str, wid, amount))
                     st.session_state[f"kp_{day_str}_{wid}_buf"] = ""
 
-                # ✅ WRITE: Incasso -> write_and_sync
                 if st.button("INCASSO", key=f"settle_{day_str}_{wid}", use_container_width=True):
                     write_and_sync(lambda: settle_unsettled_for_waiter_day(day_str, wid))
 
                 st.divider()
                 for tx_id, amt, created_at, settled, voided in txs[:15]:
                     st.write(f"{fmt_time_from_iso(created_at)} — € {amt:,.2f} — {ui_status(settled, voided)}".replace(",", " "))
-                    # ✅ WRITE: void -> write_and_sync
                     if voided == 0 and settled == 0:
-                        if st.button("🗑️ Annulla", key=f"void_{tx_id}"):
+                        if st.button("🗑️ Annulla", key=f"void_{tx_id}", use_container_width=True):
                             write_and_sync(lambda tid=tx_id: void_tx(tid))
 
     st.divider()
     st.subheader("Camerieri in servizio oggi")
     new_selected = st.multiselect("Seleziona i camerieri presenti oggi", options=names, default=st.session_state[sel_key])
 
-    # ✅ WRITE: Applica selezione -> write_and_sync
     if st.button("✅ Applica selezione", type="primary", use_container_width=True):
         st.session_state[sel_key] = new_selected
         write_and_sync(lambda: set_shift_waiters(day_str, [name_to_id[n] for n in new_selected if n in name_to_id]))
@@ -839,7 +891,6 @@ elif page == "Registra Incassi":
 # ---------------------------
 elif page == "Camerieri":
     st.title("Camerieri")
-
     left, right = st.columns([1, 2], gap="large")
 
     with left:
@@ -848,7 +899,6 @@ elif page == "Camerieri":
             name = st.text_input("Nome", placeholder="Es. Giovanni")
             ok = st.form_submit_button("Salva")
             if ok:
-                # ✅ WRITE: add_waiter -> write_and_sync
                 write_and_sync(lambda: add_waiter(name))
 
     with right:
@@ -859,7 +909,6 @@ elif page == "Camerieri":
             c1.write(f"**{name}**")
             new_active = c2.toggle("Attivo", value=bool(active), key=f"act_{wid}")
             if new_active != bool(active):
-                # ✅ WRITE: set_waiter_active -> write_and_sync
                 write_and_sync(lambda w=wid, a=new_active: set_waiter_active(w, a))
 
 # ---------------------------
