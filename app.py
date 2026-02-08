@@ -1,14 +1,14 @@
 # ============================================================
-# BINGO CASSA — Streamlit + TURSO (libSQL) — FAST VERSION
-# Obiettivi performance (DB remoto):
-# ✅ 1 query "grossa" per tutte le transazioni del giorno (non N per cameriere)
-# ✅ Cache con TTL + invalidazione mirata dopo write
-# ✅ NIENTE st.rerun() dentro keypad / bottoni (Streamlit rerunna già)
-# ✅ Rendering limitato (ultime 30 + expander per tutto)
+# BINGO CASSA — Streamlit + TURSO (libSQL) — FAST + STABLE
+# - Auth con password + TTL
+# - Turso via SQLAlchemy (sqlite+libsql://...)
+# - Reads: text()+execute() (evita bug pandas+params su libsql)
+# - 1 query al giorno per tx + aggregazioni in RAM
+# - Rendering limitato (ultime 30 + expander)
 #
 # SECRETS (Streamlit -> Settings -> Secrets):
 # APP_PASSWORD="..."
-# TURSO_DATABASE_URL="libsql://xxxx.turso.io"
+# TURSO_DATABASE_URL="libsql://bingo-cassa-xxxx.turso.io"
 # TURSO_AUTH_TOKEN="xxxxx"
 #
 # requirements.txt:
@@ -21,14 +21,13 @@
 from __future__ import annotations
 
 import time as pytime
-from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Dict, List, Tuple, Optional
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 
 # ---------------------------
 # Streamlit config (UNA sola volta)
@@ -72,16 +71,23 @@ require_password()
 TZ = ZoneInfo("Europe/Zurich")
 CUTOFF_HOUR = 12  # business day 12:00 -> 12:00
 
+def now_iso() -> str:
+    return datetime.now(TZ).isoformat(timespec="seconds")
+
 # ---------------------------
-# Turso engine
+# Turso engine (CORRETTO)
 # ---------------------------
 @st.cache_resource
 def get_engine():
-    url = st.secrets.get("TURSO_DATABASE_URL")
+    url = st.secrets.get("TURSO_DATABASE_URL")  # es: libsql://...turso.io
     token = st.secrets.get("TURSO_AUTH_TOKEN")
+
     if not url or not token:
         st.error("❌ Turso non configurato. Aggiungi TURSO_DATABASE_URL e TURSO_AUTH_TOKEN nei Secrets.")
         st.stop()
+
+    # forza stringa valida per SQLAlchemy: sqlite+libsql://HOST
+    db_host = url.replace("libsql://", "").strip()
 
     engine = create_engine(
         f"sqlite+libsql://{db_host}",
@@ -91,9 +97,6 @@ def get_engine():
     return engine
 
 ENGINE = get_engine()
-
-def now_iso() -> str:
-    return datetime.now(TZ).isoformat(timespec="seconds")
 
 # ---------------------------
 # Business day helpers (12->12)
@@ -205,25 +208,27 @@ def set_shift_waiters(day_str: str, waiter_ids: List[int]):
             )
 
 # ---------------------------
-# READS (caching)
+# READS (caching) — STABLE: text()+execute()
 # ---------------------------
 @st.cache_data(ttl=2)
 def get_waiters_df(active_only: bool) -> pd.DataFrame:
-    q = "SELECT id, name, active FROM waiters "
-    q += "WHERE active=1 " if active_only else ""
-    q += "ORDER BY " + ("name" if active_only else "active DESC, name")
-    return pd.read_sql_query(q, ENGINE)
+    if active_only:
+        q = text("SELECT id, name, active FROM waiters WHERE active=1 ORDER BY name;")
+        params = {}
+    else:
+        q = text("SELECT id, name, active FROM waiters ORDER BY active DESC, name;")
+        params = {}
+
+    with ENGINE.connect() as conn:
+        rows = conn.execute(q, params).mappings().all()
+    return pd.DataFrame(rows)
 
 @st.cache_data(ttl=2)
 def get_shift_waiters_ids(day_str: str) -> List[int]:
-    df = pd.read_sql_query(
-        "SELECT waiter_id FROM shift_waiters WHERE day=? ORDER BY waiter_id;",
-        ENGINE,
-        params=[day_str],
-    )
-    if df.empty:
-        return []
-    return [int(x) for x in df["waiter_id"].tolist()]
+    q = text("SELECT waiter_id FROM shift_waiters WHERE day=:day ORDER BY waiter_id;")
+    with ENGINE.connect() as conn:
+        rows = conn.execute(q, {"day": day_str}).all()
+    return [int(r[0]) for r in rows]
 
 @st.cache_data(ttl=2)
 def get_tx_day_df(day_str: str) -> pd.DataFrame:
@@ -250,7 +255,6 @@ def get_tx_day_df(day_str: str) -> pd.DataFrame:
     return df
 
 def invalidate_caches():
-    # invalida SOLO cache_data (non cache_resource)
     st.cache_data.clear()
 
 def ui_status(settled: int, voided: int) -> str:
@@ -261,7 +265,7 @@ def ui_status(settled: int, voided: int) -> str:
     return "Aperto"
 
 # ---------------------------
-# CSS (il tuo, invariato)
+# CSS (tuo)
 # ---------------------------
 st.markdown(
     """
@@ -307,7 +311,7 @@ h3 { margin-top: 0 !important; margin-bottom: 4px !important; }
 )
 
 # ---------------------------
-# Keypad (FAST: nessun rerun qui)
+# Keypad (FAST: nessun st.rerun qui)
 # ---------------------------
 def keypad_widget(prefix: str, currency: str = "€") -> float:
     buf_key = f"{prefix}_buf"
@@ -409,12 +413,7 @@ KEY_TO_PAGE = {
     "camerieri": "Camerieri",
     "storico": "Storico Incassi",
 }
-
-NAV_MENU = [
-    ("dashboard", "Dashboard"),
-    ("camerieri", "Camerieri"),
-    ("storico", "Storico"),
-]
+NAV_MENU = [("dashboard", "Dashboard"), ("camerieri", "Camerieri"), ("storico", "Storico")]
 
 def _goto(page_key: str):
     st.query_params["page"] = page_key
@@ -436,39 +435,32 @@ with st.sidebar:
         day_str = date.today().isoformat()
 
     st.markdown("<div class='sb-title'>BINGO CASSA</div>", unsafe_allow_html=True)
-
     for key, label in NAV_MENU:
         if st.button(label, key=f"nav_{key}", width="stretch"):
             _goto(key)
 
 # ---------------------------
-# Preload dati (1 sola volta per pagina/exec)
+# Preload dati
 # ---------------------------
 waiters_active_df = get_waiters_df(active_only=True)
 waiters_all_df = get_waiters_df(active_only=False)
 tx_day_df = get_tx_day_df(day_str) if page in ["Dashboard", "Registra Incassi"] else pd.DataFrame()
 
-# helper maps
-id_to_name_all = {int(r["id"]): str(r["name"]) for _, r in waiters_all_df.iterrows()} if not waiters_all_df.empty else {}
-id_to_name_active = {int(r["id"]): str(r["name"]) for _, r in waiters_active_df.iterrows()} if not waiters_active_df.empty else {}
-
 # ---------------------------
 # Aggregazioni in Python (fast)
 # ---------------------------
 def totals_maps_from_df(df: pd.DataFrame) -> Tuple[Dict[int, float], Dict[int, float], Dict[int, float]]:
-    # all / open / paid (voided esclusi)
     if df.empty:
         return {}, {}, {}
     valid = df[df["voided"] == 0]
     all_map = valid.groupby("waiter_id")["amount"].sum().to_dict()
     open_map = valid[valid["settled"] == 0].groupby("waiter_id")["amount"].sum().to_dict()
     paid_map = valid[valid["settled"] == 1].groupby("waiter_id")["amount"].sum().to_dict()
-
-    # cast keys/values
-    all_map = {int(k): float(v) for k, v in all_map.items()}
-    open_map = {int(k): float(v) for k, v in open_map.items()}
-    paid_map = {int(k): float(v) for k, v in paid_map.items()}
-    return all_map, open_map, paid_map
+    return (
+        {int(k): float(v) for k, v in all_map.items()},
+        {int(k): float(v) for k, v in open_map.items()},
+        {int(k): float(v) for k, v in paid_map.items()},
+    )
 
 tot_all_map, tot_open_map, tot_paid_map = totals_maps_from_df(tx_day_df)
 
@@ -478,7 +470,6 @@ tot_all_map, tot_open_map, tot_paid_map = totals_maps_from_df(tx_day_df)
 
 if page == "Dashboard":
     st.title("Dashboard")
-
     if waiters_active_df.empty:
         st.info("Nessun cameriere attivo.")
         st.stop()
@@ -495,16 +486,13 @@ if page == "Dashboard":
 
     st.divider()
     st.subheader("Riepilogo per cameriere")
-
     cols = st.columns(min(4, len(waiters)))
     for i, (wid, name, _) in enumerate(waiters):
         with cols[i % len(cols)]:
-            open_amt = tot_open_map.get(wid, 0.0)
-            paid_amt = tot_paid_map.get(wid, 0.0)
             st.metric(
                 name,
-                f"Da incassare: €{open_amt:,.2f}".replace(",", " "),
-                delta=f" Totale incassato: €{paid_amt:,.2f}".replace(",", " ")
+                f"Da incassare: €{tot_open_map.get(wid, 0.0):,.2f}".replace(",", " "),
+                delta=f" Totale incassato: €{tot_paid_map.get(wid, 0.0):,.2f}".replace(",", " ")
             )
 
 elif page == "Registra Incassi":
@@ -517,7 +505,6 @@ elif page == "Registra Incassi":
     names = sorted([name for _, name, _ in waiters_active], key=lambda x: x.lower())
     name_to_id = {name: wid for wid, name, _ in waiters_active}
 
-    # shift selection (DB -> session)
     sel_key = f"selected_names_{day_str}"
     if sel_key not in st.session_state:
         shift_ids = get_shift_waiters_ids(day_str)
@@ -533,16 +520,12 @@ elif page == "Registra Incassi":
 
         for i, wid in enumerate(selected_ids):
             name = id_to_name[wid]
-
             with cols[i]:
-                # filtra dal DF del giorno (NO query)
                 df_w = tx_day_df[tx_day_df["waiter_id"] == wid].copy() if not tx_day_df.empty else pd.DataFrame()
                 txs = df_w[["id", "amount", "created_at", "settled", "voided"]].values.tolist() if not df_w.empty else []
 
                 tot_open = float(tot_open_map.get(wid, 0.0))
-                has_unsettled = False
-                if not df_w.empty:
-                    has_unsettled = bool(((df_w["settled"] == 0) & (df_w["voided"] == 0)).any())
+                has_unsettled = bool(((df_w["settled"] == 0) & (df_w["voided"] == 0)).any()) if not df_w.empty else False
 
                 with st.container(border=True):
                     h_name, h_btn, h_tot = st.columns([3.8, 2.2, 2.7], gap="small")
@@ -607,13 +590,7 @@ elif page == "Registra Incassi":
                     with left_pad:
                         amount = keypad_widget(prefix=f"kp_{day_str}_{wid}")
 
-                        add_clicked = st.button(
-                            "Aggiungi",
-                            type="primary",
-                            width="stretch",
-                            key=f"add_{day_str}_{wid}"
-                        )
-                        if add_clicked:
+                        if st.button("Aggiungi", type="primary", width="stretch", key=f"add_{day_str}_{wid}"):
                             try:
                                 add_tx(day_str, wid, amount)
                                 st.session_state[f"kp_{day_str}_{wid}_buf"] = ""
@@ -627,8 +604,7 @@ elif page == "Registra Incassi":
                         if not txs:
                             st.caption("—")
                         else:
-                            last9 = txs[:9]
-                            for _id, amt, _created_at, _settled, voided in last9:
+                            for _id, amt, _created_at, _settled, voided in txs[:9]:
                                 if int(voided) == 1:
                                     st.markdown(
                                         f"""
@@ -658,12 +634,10 @@ elif page == "Registra Incassi":
 
                     st.divider()
 
-                    # Rendering: ultime 30 + expander (performance)
                     if not txs:
                         st.caption("Nessun incasso oggi")
                     else:
                         show_n = 30
-                        txs_show = txs[:show_n]
 
                         def render_rows(rows):
                             for tx_id, amt, created_at, settled, voided in rows:
@@ -723,20 +697,15 @@ elif page == "Registra Incassi":
                                             invalidate_caches()
                                             st.rerun()
 
-                        render_rows(txs_show)
-
+                        render_rows(txs[:show_n])
                         if len(txs) > show_n:
                             with st.expander(f"Mostra tutte ({len(txs)})"):
-                                # qui puoi anche usare st.dataframe per essere ancora più veloce
-                                # ma mantengo lo stile originale:
                                 render_rows(txs[show_n:])
 
         st.divider()
         overall_open = sum(float(tot_open_map.get(wid, 0.0)) for wid in selected_ids)
-        a, _ = st.columns(2)
-        a.metric("Totale da incassare (selezionati)", f"€{overall_open:,.2f}".replace(",", " "))
+        st.metric("Totale da incassare (selezionati)", f"€{overall_open:,.2f}".replace(",", " "))
 
-    # Camerieri in servizio oggi
     st.divider()
     st.subheader("Camerieri in servizio oggi")
 
@@ -746,8 +715,7 @@ elif page == "Registra Incassi":
         default=st.session_state[sel_key],
     )
 
-    apply_clicked = st.button("✅ Applica selezione", type="primary", width="stretch")
-    if apply_clicked:
+    if st.button("✅ Applica selezione", type="primary", width="stretch"):
         st.session_state[sel_key] = new_selected
         set_shift_waiters(day_str, [name_to_id[n] for n in new_selected if n in name_to_id])
         invalidate_caches()
@@ -755,7 +723,6 @@ elif page == "Registra Incassi":
 
 elif page == "Camerieri":
     st.title("Camerieri")
-
     left, right = st.columns([1, 2], gap="large")
 
     with left:
@@ -794,7 +761,6 @@ elif page == "Camerieri":
 else:
     st.title("Storico Incassi")
 
-    # filtri
     f1, f2, f3 = st.columns([1, 1, 1.2], gap="small")
     with f1:
         d_from = st.date_input("Da", value=date.today().replace(day=1))
@@ -809,20 +775,25 @@ else:
         name_to_id_all = {str(r["name"]): int(r["id"]) for _, r in waiters_all_df.iterrows()}
         waiter_id = name_to_id_all.get(choice)
 
-    # query storico (qui va bene farla: è pagina "storico")
-    q = """
-    SELECT t.id, t.day, w.name AS cameriere, t.amount, t.created_at, t.settled, t.voided
-    FROM transactions t
-    JOIN waiters w ON w.id=t.waiter_id
-    WHERE t.day BETWEEN ? AND ?
+    # STORICO: text()+execute() (no pandas params)
+    base_sql = """
+        SELECT t.id, t.day, w.name AS cameriere, t.amount, t.created_at, t.settled, t.voided
+        FROM transactions t
+        JOIN waiters w ON w.id=t.waiter_id
+        WHERE t.day BETWEEN :dfrom AND :dto
     """
-    params: List[object] = [d_from.isoformat(), d_to.isoformat()]
     if waiter_id:
-        q += " AND t.waiter_id=?"
-        params.append(int(waiter_id))
-    q += " ORDER BY t.day DESC, t.id DESC;"
+        base_sql += " AND t.waiter_id = :wid "
+    base_sql += " ORDER BY t.day DESC, t.id DESC;"
 
-    df = pd.read_sql_query(q, ENGINE, params=params)
+    q = text(base_sql)
+    params = {"dfrom": d_from.isoformat(), "dto": d_to.isoformat()}
+    if waiter_id:
+        params["wid"] = int(waiter_id)
+
+    with ENGINE.connect() as conn:
+        rows = conn.execute(q, params).mappings().all()
+    df = pd.DataFrame(rows)
 
     if df.empty:
         st.info("Nessun dato nel periodo selezionato.")
@@ -830,9 +801,10 @@ else:
         df["Stato"] = df.apply(lambda r: ui_status(r["settled"], r["voided"]), axis=1)
         cols = [c for c in ["id", "day", "cameriere", "amount", "created_at", "Stato"] if c in df.columns]
         df_view = df[cols].copy()
+
         st.dataframe(df_view, width="stretch")
 
-        valid_mask = (df["voided"] == 0) if "voided" in df.columns else pd.Series([True] * len(df))
+        valid_mask = (df["voided"].astype(int) == 0) if "voided" in df.columns else pd.Series([True] * len(df))
         total = df.loc[valid_mask, "amount"].sum()
 
         c1, c2, c3 = st.columns(3)
