@@ -84,7 +84,7 @@ def get_engine():
         st.stop()
 
     engine = create_engine(
-        f"sqlite+{url}?secure=true",
+        f"sqlite+libsql://{db_host}",
         connect_args={"auth_token": token},
         pool_pre_ping=True,
     )
@@ -227,19 +227,21 @@ def get_shift_waiters_ids(day_str: str) -> List[int]:
 
 @st.cache_data(ttl=2)
 def get_tx_day_df(day_str: str) -> pd.DataFrame:
-    # UNA query per tutto il giorno (chiave performance)
-    q = """
-    SELECT t.id, t.day, t.waiter_id, w.name AS cameriere,
-           t.amount, t.created_at, t.settled, t.voided
-    FROM transactions t
-    JOIN waiters w ON w.id=t.waiter_id
-    WHERE t.day=?
-    ORDER BY t.id DESC;
-    """
-    df = pd.read_sql_query(q, ENGINE, params=[day_str])
+    q = text("""
+        SELECT t.id, t.day, t.waiter_id, w.name AS cameriere,
+               t.amount, t.created_at, t.settled, t.voided
+        FROM transactions t
+        JOIN waiters w ON w.id=t.waiter_id
+        WHERE t.day = :day
+        ORDER BY t.id DESC;
+    """)
+    with ENGINE.connect() as conn:
+        rows = conn.execute(q, {"day": day_str}).mappings().all()
+
+    df = pd.DataFrame(rows)
     if df.empty:
         return df
-    # tipi coerenti
+
     df["id"] = df["id"].astype(int)
     df["waiter_id"] = df["waiter_id"].astype(int)
     df["amount"] = df["amount"].astype(float)
